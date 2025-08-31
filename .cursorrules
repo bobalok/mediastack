@@ -1,0 +1,102 @@
+MediaStack repository guidance for Cursor IDE and AI assistants
+
+Purpose
+- Provide high-signal context so AI understands this repo’s intent, structure, and safe-edit rules.
+- Prevent edits that would break network security, reverse-proxy routing, or storage mappings.
+
+Project overview
+- MediaStack is a Docker-based homelab media stack (Jellyfin/Plex + *ARR apps) with Traefik reverse proxy, Authentik SSO, CrowdSec WAF/bouncer, optional Gluetun VPN egress, and optional Tailscale/Headscale mesh.
+- Users deploy by combining the base-working-files with one docker-compose variant, configuring .env, then running restart.sh.
+
+Key directories
+- base-working-files/: shared configs and helper scripts (e.g., traefik-*.yaml, restart.sh, headscale-*.yaml)
+- full-download-vpn/: docker-compose.yaml where most media apps’ egress routes via Gluetun (VPN for all media/download apps)
+- mini-download-vpn/: docker-compose.yaml where only qBittorrent and SABnzbd route via Gluetun (partial VPN)
+- no-download-vpn/: docker-compose.yaml without Gluetun (no VPN)
+- archived-old-configs/: historical compose files; do not edit for active deployments
+
+Compose variants (behavioral differences)
+- Full Download VPN
+  - Many app services use network_mode: "service:gluetun". Gluetun exposes the needed ports; dependent containers must NOT expose ports directly.
+- Mini Download VPN
+  - Only qBittorrent and SABnzbd are behind Gluetun; other apps use the standard mediastack bridge network and may expose ports directly as configured.
+- No Download VPN
+  - No Gluetun; all apps use the mediastack bridge network and expose ports directly as configured.
+
+Core components
+- Traefik: reverse proxy; TLS v1.2/v1.3 only; Cloudflare DNS-01 via CF_DNS_API_TOKEN; security headers; CrowdSec bouncer plugin.
+- Authentik: SSO/IdP; do not protect Authentik itself with forwardauth, or other apps will fail to auth via it.
+- CrowdSec: security engine/WAF; bouncer plugin enforced in Traefik middlewares.
+- Gluetun: outbound VPN; also forwards inbound ports for apps attached via network_mode: "service:gluetun".
+- Headscale/Headplane/Tailscale: optional mesh and admin UI.
+
+Networking
+- Single custom bridge network: mediastack (subnet/gateway from .env via ${DOCKER_SUBNET}, ${DOCKER_GATEWAY}).
+- Traefik routers/labels are applied to many services; middlewares typically include: authentik-forwardauth@file, security-headers@file, traefik-bouncer@file.
+- Exceptions mandated by comments in compose files:
+  - Do NOT add authentik-forwardauth@file to Authentik and Headscale routers.
+  - ddns-updater, Heimdall, Homepage, Portainer must NOT connect through Gluetun.
+
+Storage mapping conventions
+- FOLDER_FOR_MEDIA on host maps to /data (and /data/media for some) inside containers; includes media, torrents, usenet, watch, and optional filebot input/output.
+- FOLDER_FOR_DATA on host stores persistent app configs per app directory.
+- restart.sh creates and permissions these paths; avoid changing mount points unless user explicitly requests.
+
+Traefik configuration files (in base-working-files/)
+- traefik-static.yaml: static config; replace example.com with the user’s domain; uses Cloudflare DNS challenge; exposes web→secureweb redirect; metrics on :8082.
+- traefik-dynamic.yaml and traefik-internal.yaml: dynamic middlewares, TLS options, forward-auth, bouncer; referenced by Traefik container via mounted /etc/traefik.
+
+Environment variables (non-exhaustive, critical)
+- Networking: DOCKER_SUBNET, DOCKER_GATEWAY, LOCAL_SUBNET, LOCAL_DOCKER_IP
+- Reverse proxy: CLOUDFLARE_DNS_ZONE, CLOUDFLARE_DNS_API_TOKEN, REVERSE_PROXY_PORT_HTTP, REVERSE_PROXY_PORT_HTTPS
+- Identity & DB: AUTHENTIK_VERSION, AUTHENTIK_SECRET_KEY, AUTHENTIK_DATABASE, POSTGRESQL_USERNAME, POSTGRESQL_PASSWORD, POSTGRESQL_PORT
+- VPN: VPN_SERVICE_PROVIDER, VPN_USERNAME, VPN_PASSWORD, GLUETUN_CONTROL_PORT, VPN_TYPE/WireGuard keys or OpenVPN config
+- Tailscale/Headscale: TAILSCALE_AUTHKEY; replace example.com domains in headscale/plane configs
+- Media paths and perms: FOLDER_FOR_MEDIA, FOLDER_FOR_DATA, PUID, PGID, UMASK, TIMEZONE
+- App ports: WEBUI_PORT_* and METRICS_* as defined in compose
+- Keep ${VAR:?err} guards intact; they protect from unsafe startup when env is missing.
+
+Safe-edit rules (very important)
+- Do not expose ports on containers that are attached via network_mode: "service:gluetun"; expose such ports only on the Gluetun service.
+- Do not modify Traefik middlewares for Authentik and Headscale to include forwardauth; this breaks auth flows.
+- Do not connect ddns-updater, Heimdall, Homepage, or Portainer to Gluetun.
+- Preserve Traefik label structure (routers/services/middlewares) and keep Host(`subdomain.${CLOUDFLARE_DNS_ZONE}`) patterns.
+- Preserve indentation, spacing, and comment banners in YAML (triple-# headers used throughout). Avoid reformatting unrelated sections.
+- Do not remove healthchecks, depends_on with conditions, or ipam network config.
+- Do not change or hardcode paths under FOLDER_FOR_MEDIA or FOLDER_FOR_DATA without explicit instruction.
+- Avoid altering image names/tags unless user asks. Default is :latest or as specified.
+- Never commit secrets; keep secrets in .env only. Keep Cloudflare token and database credentials out of repo files.
+
+Typical workflows to assist users
+- Fresh deploy
+  1) Copy all files from base-working-files/ and one docker-compose.yaml (from the chosen variant) into a single working directory on the Docker host.
+  2) Fill required .env variables (honor ${VAR:?err}).
+  3) Run restart.sh to create directories, set permissions, validate, pull images, and start services.
+- Post-deploy hardening
+  - Run secure_authentik_database.sh and create_guacamole_database.sh as indicated in README after initial startup.
+- Connectivity checks (from README)
+  - docker ps; docker network inspect mediastack; check Gluetun IP with ifconfig.io via docker exec.
+
+When making automated edits
+- Prefer targeted edits to a single service block rather than broad refactors.
+- If changing a port for an app behind Gluetun, update the port mapping on Gluetun and the Traefik service.port label for that app.
+- If adding a new app:
+  - Mount /data and /config according to conventions.
+  - Add Traefik labels consistent with existing patterns.
+  - Decide whether it belongs behind Gluetun (full/mini variants) and configure accordingly.
+- Keep compose files between variants consistent where possible; only differ in Gluetun attachment/ports per the variant’s intent.
+
+Assistant answering preferences
+- Be concise; include exact file paths and service names in backticks.
+- Show minimal diffs in YAML (only changed keys/lines), and remind to update .env if new variables are introduced.
+- Call out any change that impacts security boundary (reverse proxy, auth, VPN routing) and ask for confirmation if non-trivial.
+
+Do not edit list
+- archived-old-configs/** (unless explicitly asked)
+- Generated or host-only secrets (.env) — never commit sample secrets without placeholders.
+
+Quick reference: special cases from compose comments
+- Authentik and Headscale: do not add authentik-forwardauth@file middleware.
+- qBittorrent must always use VPN in full/mini variants.
+- Gluetun manages inbound ports for its attached services; dependent services should not have their own ports section.
+- ddns-updater MUST NOT connect through Gluetun.
